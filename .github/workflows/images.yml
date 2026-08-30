@@ -22,6 +22,7 @@ jobs:
         run: echo "matrix=$(jq -c . .github/image-matrix.json)" >> "$GITHUB_OUTPUT"
 
   build_and_publish_images:
+    if: github.event.repository.fork != true
     name: Build and push ${{ matrix.spec.name }} container image to GHCR and QUAY
     needs: prepare
     strategy:

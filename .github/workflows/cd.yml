@@ -7,6 +7,7 @@ jobs:
   code-checks:
     uses: ./.github/workflows/job-checks.yml
   pre-release-check:
+    if: github.event.repository.fork != true
     runs-on: ubuntu-latest
     outputs:
       TARGET_TAG_V: ${{ steps.version_check.outputs.TRGT_VERSION }}
@@ -30,7 +31,7 @@ jobs:
         run: uv run --no-sync semantic-release changelog --unreleased
   release:
     needs: [code-checks, pre-release-check]
-    if: needs.pre-release-check.outputs.TARGET_TAG_V != ''
+    if: needs.pre-release-check.outputs.TARGET_TAG_V != '' && github.event.repository.fork != true
     environment: auto-release
     runs-on: ubuntu-latest
     concurrency: release

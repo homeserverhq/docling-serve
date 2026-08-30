@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   dco_advisor:
+    if: github.event.repository.fork != true
     runs-on: ubuntu-latest
     steps:
       - name: Handle DCO check result
