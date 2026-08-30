@@ -354,6 +354,15 @@ def wait_task_finish(auth: str, task_id: str, return_as_file: bool):
     )
 
 
+def _picture_description_preset() -> str:
+    if (
+        docling_serve_settings.default_picture_description_preset
+        in docling_serve_settings.custom_picture_description_presets
+    ):
+        return docling_serve_settings.default_picture_description_preset
+    return "default"
+
+
 def process_url(
     auth,
     input_sources,
@@ -395,6 +404,8 @@ def process_url(
             "do_formula_enrichment": do_formula_enrichment,
             "do_picture_classification": do_picture_classification,
             "do_picture_description": do_picture_description,
+            "picture_description_preset": _picture_description_preset(),
+            "picture_description_area_threshold": docling_serve_settings.picture_description_area_threshold,
         },
         "target": target,
     }
@@ -486,6 +497,8 @@ def process_file(
             "do_formula_enrichment": do_formula_enrichment,
             "do_picture_classification": do_picture_classification,
             "do_picture_description": do_picture_description,
+            "picture_description_preset": _picture_description_preset(),
+            "picture_description_area_threshold": docling_serve_settings.picture_description_area_threshold,
         },
         "target": target,
     }

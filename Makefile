@@ -19,8 +19,8 @@ endif
 # Container runtime - can be overridden: make CONTAINER_RUNTIME=podman cmd
 CONTAINER_RUNTIME ?= docker
 
-TAG=$(shell git rev-parse HEAD)
-BRANCH_TAG=$(shell git rev-parse --abbrev-ref HEAD)
+TAG=v1.31.0
+BRANCH_TAG=v1.31.0
 
 action-lint-file:
 	$(CMD_PREFIX) touch .action-lint
@@ -41,6 +41,7 @@ docling-serve-cpu-image: Containerfile ## Build docling-serve "cpu only" contain
 	$(CMD_PREFIX) $(CONTAINER_RUNTIME) build --load --build-arg "UV_SYNC_EXTRA_ARGS=--no-group pypi --group cpu --no-extra flash-attn" -f Containerfile -t ghcr.io/docling-project/docling-serve-cpu:$(TAG) .
 	$(CMD_PREFIX) $(CONTAINER_RUNTIME) tag ghcr.io/docling-project/docling-serve-cpu:$(TAG) ghcr.io/docling-project/docling-serve-cpu:$(BRANCH_TAG)
 	$(CMD_PREFIX) $(CONTAINER_RUNTIME) tag ghcr.io/docling-project/docling-serve-cpu:$(TAG) quay.io/docling-project/docling-serve-cpu:$(BRANCH_TAG)
+	$(CMD_PREFIX) $(CONTAINER_RUNTIME) tag ghcr.io/docling-project/docling-serve-cpu:$(TAG) hshq/docling-serve:$(TAG)
 
 .PHONY: docling-serve-cu124-image
 docling-serve-cu124-image: Containerfile ## Build docling-serve container image with CUDA 12.4 support

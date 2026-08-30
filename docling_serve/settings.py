@@ -336,6 +336,7 @@ class DoclingServeSettings(BaseSettings):
 
     # Picture Description Control
     default_picture_description_preset: str = "smolvlm"
+    picture_description_area_threshold: float = 0.05
     allowed_picture_description_presets: Optional[list[str]] = None
     custom_picture_description_presets: dict[str, Any] = Field(default_factory=dict)
     allowed_picture_description_engines: Optional[list[str]] = None
