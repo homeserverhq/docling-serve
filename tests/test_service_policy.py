@@ -65,6 +65,42 @@ def test_normalize_convert_options_sets_default_timeout():
     assert normalized.document_timeout == policy.max_document_timeout
 
 
+def test_normalize_convert_options_applies_picture_area_threshold_default():
+    policy = build_service_policy(DoclingServeSettings())
+    settings = DoclingServeSettings(picture_description_area_threshold=0.01)
+
+    normalized = normalize_convert_options(
+        ConvertDocumentsOptions(do_picture_description=True), policy, settings
+    )
+
+    assert normalized.picture_description_area_threshold == 0.01
+
+
+def test_normalize_convert_options_preserves_explicit_picture_area_threshold():
+    policy = build_service_policy(DoclingServeSettings())
+    settings = DoclingServeSettings(picture_description_area_threshold=0.01)
+
+    normalized = normalize_convert_options(
+        ConvertDocumentsOptions(
+            do_picture_description=True,
+            picture_description_area_threshold=0.03,
+        ),
+        policy,
+        settings,
+    )
+
+    assert normalized.picture_description_area_threshold == 0.03
+
+
+def test_normalize_convert_options_ignores_threshold_when_description_inactive():
+    policy = build_service_policy(DoclingServeSettings())
+    settings = DoclingServeSettings(picture_description_area_threshold=0.01)
+
+    normalized = normalize_convert_options(ConvertDocumentsOptions(), policy, settings)
+
+    assert normalized.picture_description_area_threshold == 0.05
+
+
 def test_normalize_convert_options_placeholder_disables_images():
     policy = build_service_policy(DoclingServeSettings())
 

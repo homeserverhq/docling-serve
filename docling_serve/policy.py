@@ -30,7 +30,7 @@ from docling_jobkit.connectors.connector_factory import (
     get_target_connector_factory,
 )
 
-from docling_serve.settings import DoclingServeSettings
+from docling_serve.settings import DoclingServeSettings, docling_serve_settings
 
 
 def _models_by_kind(annotation: Any) -> dict[str, type[BaseModel]]:
@@ -321,12 +321,33 @@ def resolve_default_target(policy: ServicePolicy) -> TargetRequest:
 
 
 def normalize_convert_options(
-    options: ConvertDocumentsOptions, policy: ServicePolicy
+    options: ConvertDocumentsOptions,
+    policy: ServicePolicy,
+    settings: DoclingServeSettings | None = None,
 ) -> ConvertDocumentsOptions:
+    settings = settings or docling_serve_settings
     updates: dict[str, Any] = {}
 
     if options.document_timeout is None:
         updates["document_timeout"] = policy.max_document_timeout
+
+    # Docling copies the request-level threshold onto the picture description
+    # options, overriding the preset's value. Apply the deployment default when
+    # the caller omitted it, while preserving explicit overrides.
+    picture_description_active = (
+        options.do_picture_description
+        or options.picture_description_preset is not None
+        or options.picture_description_custom_config is not None
+        or options.picture_description_local is not None
+        or options.picture_description_api is not None
+    )
+    if (
+        picture_description_active
+        and "picture_description_area_threshold" not in options.model_fields_set
+    ):
+        updates["picture_description_area_threshold"] = (
+            settings.picture_description_area_threshold
+        )
 
     # Placeholder export mode discards all image data, so generating images would
     # be wasted work. Coerce the include_* flags off rather than rejecting the
@@ -344,10 +365,14 @@ def normalize_convert_options(
 
 
 def normalize_request(
-    request: _ConvertRequestT, policy: ServicePolicy
+    request: _ConvertRequestT,
+    policy: ServicePolicy,
+    settings: DoclingServeSettings | None = None,
 ) -> _ConvertRequestT:
     return request.model_copy(
-        update={"options": normalize_convert_options(request.options, policy)},
+        update={
+            "options": normalize_convert_options(request.options, policy, settings)
+        },
         deep=True,
     )
 

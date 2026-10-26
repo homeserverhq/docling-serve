@@ -86,6 +86,21 @@ def test_offline_api_docs_routes_are_not_registered_when_disabled(
     assert client.get(path).status_code == 404
 
 
+def test_openapi_exposes_configured_picture_area_threshold(make_client) -> None:
+    client = make_client(
+        enable_api_docs=True,
+        static_path=None,
+        picture_description_area_threshold=0.012,
+    )
+
+    schema = client.get("/openapi.json").json()
+    field = schema["components"]["schemas"]["ConvertDocumentsOptions"]["properties"][
+        "picture_description_area_threshold"
+    ]
+
+    assert field["default"] == 0.012
+
+
 def test_disabling_api_docs_keeps_the_api_routes(make_client) -> None:
     client = make_client(enable_api_docs=False, static_path=None)
 

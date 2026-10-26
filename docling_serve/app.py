@@ -156,6 +156,24 @@ _log = logging.getLogger(__name__)
 
 UI_STATIC_PATH = Path(__file__).parent / "ui_static"
 
+
+def _set_openapi_threshold_default(app: FastAPI, value: float) -> None:
+    """Expose the deployment's picture area threshold as the schema default."""
+    schema = app.openapi()
+    if schema is None:
+        return
+    properties = (
+        schema.get("components", {})
+        .get("schemas", {})
+        .get("ConvertDocumentsOptions", {})
+        .get("properties", {})
+    )
+    field = properties.get("picture_description_area_threshold")
+    if isinstance(field, dict):
+        field["default"] = value
+    app.openapi_schema = schema
+
+
 # Tracks whether warm_up_caches() has completed.  Meaningful only for the
 # LocalOrchestrator (which eagerly loads ML models); the RQ orchestrator's
 # implementation is a no-op so this event fires instantly in RQ deployments.
@@ -1757,5 +1775,9 @@ def create_app():  # noqa: C901
             },
             "top_types": [{"type": k, "count": v} for k, v in counter.most_common(20)],
         }
+
+    _set_openapi_threshold_default(
+        app, docling_serve_settings.picture_description_area_threshold
+    )
 
     return app

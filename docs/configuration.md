@@ -199,6 +199,7 @@ The following options control the behavior of the Docling converter, including p
 | ENV | Default | Description |
 | ----|---------|-------------|
 | `DOCLING_SERVE_DEFAULT_PICTURE_DESCRIPTION_PRESET` | `smolvlm` | Default picture description preset. |
+| `DOCLING_SERVE_PICTURE_DESCRIPTION_AREA_THRESHOLD` | `0.05` | Default minimum picture area fraction (0.0-1.0) for picture description. Requests that explicitly set `picture_description_area_threshold` override it. |
 | `DOCLING_SERVE_ALLOWED_PICTURE_DESCRIPTION_PRESETS` | `null` (all allowed) | List of allowed picture description preset IDs. Accepts JSON array or comma-separated string. |
 | `DOCLING_SERVE_CUSTOM_PICTURE_DESCRIPTION_PRESETS` | `{}` | Custom picture description presets. Must be a JSON object. |
 | `DOCLING_SERVE_ALLOWED_PICTURE_DESCRIPTION_ENGINES` | `null` (all allowed) | List of allowed picture description engine types. Accepts JSON array or comma-separated string. |
