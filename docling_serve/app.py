@@ -1,15 +1,16 @@
 import asyncio
-import copy
 import gc
 import hashlib
 import importlib.metadata
 import logging
 import os
+import re
 import shutil
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import Annotated, Any
 
 import psutil
@@ -39,7 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import create_model
 from scalar_fastapi import get_scalar_api_reference
 
-from docling.datamodel.base_models import DocumentStream
+from docling.datamodel.base_models import ConversionStatus, DocumentStream
 from docling.datamodel.service.callbacks import (
     CallbackSpec,
     ProgressCallbackRequest,
@@ -80,6 +81,7 @@ from docling.datamodel.service.targets import (
     ZipTarget,
 )
 from docling.datamodel.service.tasks import TaskType
+from docling_core.types.doc.common.constants import FIRST_SUPPORTED_MINOR
 from docling_jobkit.connectors.errors import (
     SourceConnectorConfigError,
     TargetConnectorConfigError,
@@ -99,6 +101,7 @@ from docling_jobkit.orchestrators.base_orchestrator import (
 from docling_jobkit.orchestrators.rq.orchestrator import RQOrchestrator
 
 from docling_serve.auth import APIKeyAuth, AuthenticationResult
+from docling_serve.capabilities import CapabilitiesResponse, build_capabilities
 from docling_serve.helper_functions import (
     DOCLING_VERSIONS,
     FormDepends,
@@ -150,6 +153,8 @@ setup_logging(
 )
 
 _log = logging.getLogger(__name__)
+
+UI_STATIC_PATH = Path(__file__).parent / "ui_static"
 
 # Tracks whether warm_up_caches() has completed.  Meaningful only for the
 # LocalOrchestrator (which eagerly loads ML models); the RQ orchestrator's
@@ -271,8 +276,12 @@ def create_app():  # noqa: C901
     )
     BatchConvertSourcesRequestModel = build_batch_request_model(service_policy)
 
+    # Without an openapi_url FastAPI registers neither the schema nor its Swagger
+    # UI and ReDoc pages; the reference routes added below follow the same flag.
+    api_docs_enabled = docling_serve_settings.enable_api_docs
     app = FastAPI(
         title="Docling Serve",
+        openapi_url="/openapi.json" if api_docs_enabled else None,
         docs_url=None if offline_docs_assets else "/swagger",
         redoc_url=None if offline_docs_assets else "/docs",
         lifespan=lifespan,
@@ -356,6 +365,7 @@ def create_app():  # noqa: C901
         redis_url=redis_url,
         metrics_port=docling_serve_settings.metrics_port,
         ray_redis_manager=ray_redis_manager,
+        ray_metrics_refresh_interval=docling_serve_settings.eng_ray_tenant_metrics_refresh_interval,
     )
 
     # Add log context middleware to extract request headers
@@ -378,37 +388,34 @@ def create_app():  # noqa: C901
         allow_headers=headers,
     )
 
-    # Mount the Gradio app
+    # Serve the web UI. The bundle is built from `ui/` and shipped in the package.
     if docling_serve_settings.enable_ui:
-        try:
-            import gradio as gr
+        if (UI_STATIC_PATH / "index.html").is_file():
+            app.frontend("/ui", directory=UI_STATIC_PATH, check_dir=False)
 
-            from docling_serve.gradio_ui import ui as gradio_ui
-            from docling_serve.settings import uvicorn_settings
+            @app.get("/", include_in_schema=False)
+            def ui_redirect() -> RedirectResponse:
+                # Relative, so it also works behind a proxy root path.
+                return RedirectResponse(url="ui/")
 
-            tmp_output_dir = get_scratch() / "gradio"
-            tmp_output_dir.mkdir(exist_ok=True, parents=True)
-            gradio_ui.gradio_output_dir = tmp_output_dir
-
-            # Build the root_path for Gradio, accounting for UVICORN_ROOT_PATH
-            gradio_root_path = (
-                f"{uvicorn_settings.root_path}/ui"
-                if uvicorn_settings.root_path
-                else "/ui"
-            )
-
-            app = gr.mount_gradio_app(
-                app,
-                gradio_ui,
-                path="/ui",
-                allowed_paths=["./logo.png", tmp_output_dir],
-                root_path=gradio_root_path,
-            )
-        except ImportError:
+            @app.middleware("http")
+            async def ui_cache_headers(request: Request, call_next):
+                response = await call_next(request)
+                path = request.url.path
+                if "/ui/assets/" in path:
+                    # Vite puts a content hash in every asset file name.
+                    response.headers.setdefault(
+                        "Cache-Control", "public, max-age=31536000, immutable"
+                    )
+                elif path.endswith("/ui") or "/ui/" in path:
+                    # index.html must be revalidated to pick up new releases.
+                    response.headers.setdefault("Cache-Control", "no-cache")
+                return response
+        else:
             _log.warning(
-                "Docling Serve enable_ui is activated, but gradio is not installed. "
-                "Install it with `pip install docling-serve[ui]` "
-                "or `pip install gradio`"
+                "Docling Serve enable_ui is activated, but the UI bundle was not "
+                "found in %s. Build it with `npm --prefix ui run build`.",
+                UI_STATIC_PATH,
             )
 
     #############################
@@ -421,36 +428,43 @@ def create_app():  # noqa: C901
             name="static",
         )
 
+    if offline_docs_assets and api_docs_enabled:
+        openapi_url = app.openapi_url
+        oauth2_redirect_url = app.swagger_ui_oauth2_redirect_url
+        assert openapi_url is not None and oauth2_redirect_url is not None
+
         @app.get("/swagger", include_in_schema=False)
         async def custom_swagger_ui_html():
             return get_swagger_ui_html(
-                openapi_url=app.openapi_url,
+                openapi_url=openapi_url,
                 title=app.title + " - Swagger UI",
-                oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+                oauth2_redirect_url=oauth2_redirect_url,
                 swagger_js_url="/static/swagger-ui-bundle.js",
                 swagger_css_url="/static/swagger-ui.css",
             )
 
-        @app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+        @app.get(oauth2_redirect_url, include_in_schema=False)
         async def swagger_ui_redirect():
             return get_swagger_ui_oauth2_redirect_html()
 
         @app.get("/docs", include_in_schema=False)
         async def redoc_html():
             return get_redoc_html(
-                openapi_url=app.openapi_url,
+                openapi_url=openapi_url,
                 title=app.title + " - ReDoc",
                 redoc_js_url="/static/redoc.standalone.js",
             )
 
-    @app.get("/scalar", include_in_schema=False)
-    async def scalar_html():
-        return get_scalar_api_reference(
-            openapi_url=app.openapi_url,
-            title=app.title,
-            scalar_favicon_url="https://raw.githubusercontent.com/docling-project/docling/refs/heads/main/docs/assets/logo.svg",
-            # hide_client_button=True,  # not yet released but in main
-        )
+    if api_docs_enabled:
+
+        @app.get("/scalar", include_in_schema=False)
+        async def scalar_html():
+            return get_scalar_api_reference(
+                openapi_url=app.openapi_url,
+                title=app.title,
+                scalar_favicon_url="https://raw.githubusercontent.com/docling-project/docling/refs/heads/main/docs/assets/logo.svg",
+                # hide_client_button=True,  # not yet released but in main
+            )
 
     ########################
     # Async / Sync helpers #
@@ -464,6 +478,7 @@ def create_app():  # noqa: C901
             | GenericChunkDocumentsRequest
         ),
         tenant_id: str | None = None,
+        target_document_version: str | None = None,
     ) -> Task:
         sources: list[TaskSource]
         enqueue_targets: list[Any]
@@ -537,6 +552,7 @@ def create_app():  # noqa: C901
             targets=enqueue_targets,
             callbacks=request.callbacks,
             metadata=task_metadata,
+            target_document_version=target_document_version,
         )
 
         _log.info(
@@ -555,6 +571,7 @@ def create_app():  # noqa: C901
         target: TargetRequest,
         callbacks: list[CallbackSpec] | None = None,
         tenant_id: str | None = None,
+        target_document_version: str | None = None,
     ) -> Task:
         _log.info(
             f"[TENANT_ID] _enqueue_file called with tenant_id='{tenant_id}', "
@@ -592,6 +609,7 @@ def create_app():  # noqa: C901
             targets=[target],
             callbacks=callbacks or [],
             metadata=metadata,
+            target_document_version=target_document_version,
         )
 
         _log.info(
@@ -599,6 +617,36 @@ def create_app():  # noqa: C901
         )
 
         return task
+
+    def _validate_accept_doc_version(accept_doc_version: str | None) -> None:
+        """Reject an Accept-Docling-Document-Version below the projector floor.
+
+        Fails fast with a clean 422 for the unambiguous case (target below every
+        projector path). The worker's ``project_to`` raise is the backstop for
+        the rare cross-version deployment where the target sits between floor and
+        the server's native version.
+        """
+        if not accept_doc_version:
+            return
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", accept_doc_version)
+        if m is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unparseable Accept-Docling-Document-Version "
+                    f"'{accept_doc_version}'"
+                ),
+            )
+        major, minor = int(m.group(1)), int(m.group(2))
+        if (major, minor) < (1, FIRST_SUPPORTED_MINOR):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"unsupported Accept-Docling-Document-Version "
+                    f"'{accept_doc_version}'; oldest supported is "
+                    f"1.{FIRST_SUPPORTED_MINOR}.0"
+                ),
+            )
 
     def _get_tenant_id_from_header(tenant_id_header: str | None) -> str:
         """Extract tenant_id from header or return default."""
@@ -707,80 +755,9 @@ def create_app():  # noqa: C901
             return ZipTarget()
         return InBodyTarget()
 
-    ##########################################
-    # Downgrade openapi 3.1 to 3.0.x helpers #
-    ##########################################
-
-    def ensure_array_items(schema):
-        """Ensure that array items are defined."""
-        if "type" in schema and schema["type"] == "array":
-            if "items" not in schema or schema["items"] is None:
-                schema["items"] = {"type": "string"}
-            elif isinstance(schema["items"], dict):
-                if "type" not in schema["items"]:
-                    schema["items"]["type"] = "string"
-
-    def handle_discriminators(schema):
-        """Ensure that discriminator properties are included in required."""
-        if "discriminator" in schema and "propertyName" in schema["discriminator"]:
-            prop = schema["discriminator"]["propertyName"]
-            if "properties" in schema and prop in schema["properties"]:
-                if "required" not in schema:
-                    schema["required"] = []
-                if prop not in schema["required"]:
-                    schema["required"].append(prop)
-
-    def handle_properties(schema):
-        """Ensure that property 'kind' is included in required."""
-        if "properties" in schema and "kind" in schema["properties"]:
-            if "required" not in schema:
-                schema["required"] = []
-            if "kind" not in schema["required"]:
-                schema["required"].append("kind")
-
-    # Downgrade openapi 3.1 to 3.0.x
-    def downgrade_openapi31_to_30(spec):
-        def strip_unsupported(obj):
-            if isinstance(obj, dict):
-                if "const" in obj and "enum" not in obj:
-                    obj = {**obj, "enum": [obj["const"]]}
-                obj = {
-                    k: strip_unsupported(v)
-                    for k, v in obj.items()
-                    if k not in ("const", "examples", "prefixItems")
-                }
-
-                handle_discriminators(obj)
-                ensure_array_items(obj)
-
-                # Check for oneOf and anyOf to handle nested schemas
-                for key in ["oneOf", "anyOf"]:
-                    if key in obj:
-                        for sub in obj[key]:
-                            handle_discriminators(sub)
-                            ensure_array_items(sub)
-
-                return obj
-            elif isinstance(obj, list):
-                return [strip_unsupported(i) for i in obj]
-            return obj
-
-        if "components" in spec and "schemas" in spec["components"]:
-            for schema_name, schema in spec["components"]["schemas"].items():
-                handle_properties(schema)
-
-        return strip_unsupported(copy.deepcopy(spec))
-
     #############################
     # API Endpoints definitions #
     #############################
-
-    @app.get("/openapi-3.0.json")
-    def openapi_30():
-        spec = app.openapi()
-        downgraded = downgrade_openapi31_to_30(spec)
-        downgraded["openapi"] = "3.0.3"
-        return JSONResponse(downgraded)
 
     # Favicon
     @app.get("/favicon.ico", include_in_schema=False)
@@ -847,6 +824,16 @@ def create_app():  # noqa: C901
     def api_check() -> HealthCheckResponse:
         return HealthCheckResponse()
 
+    if docling_serve_settings.enable_capabilities_endpoint:
+
+        @app.get("/v1/capabilities", tags=["health"])
+        def capabilities() -> CapabilitiesResponse:
+            return build_capabilities(
+                settings=docling_serve_settings,
+                policy=service_policy,
+                versions=DOCLING_VERSIONS,
+            )
+
     # Docling versions
     @app.get("/version", tags=["health"])
     def version_info() -> dict:
@@ -857,15 +844,18 @@ def create_app():  # noqa: C901
             )
         return DOCLING_VERSIONS
 
-    # Prometheus metrics endpoint
-    @app.get("/metrics", tags=["health"], include_in_schema=False)
-    def metrics():
-        from fastapi.responses import PlainTextResponse
+    # Prometheus metrics endpoint. Registered only while the Prometheus export is
+    # enabled, so a deployment that turns it off exposes no key-less route.
+    if docling_serve_settings.otel_enable_prometheus:
 
-        return PlainTextResponse(
-            content=get_metrics_endpoint_content(),
-            media_type="text/plain; version=0.0.4",
-        )
+        @app.get("/metrics", tags=["health"], include_in_schema=False)
+        def metrics():
+            from fastapi.responses import PlainTextResponse
+
+            return PlainTextResponse(
+                content=get_metrics_endpoint_content(),
+                media_type="text/plain; version=0.0.4",
+            )
 
     # Convert a document from URL(s)
     @app.post(
@@ -885,16 +875,23 @@ def create_app():  # noqa: C901
         background_tasks: BackgroundTasks,
         auth: Annotated[AuthenticationResult, Depends(require_auth)],
         orchestrator: Annotated[BaseOrchestrator, Depends(get_async_orchestrator)],
-        conversion_request: ConvertSourcesRequestModel,
+        conversion_request: ConvertSourcesRequestModel,  # ty: ignore[invalid-type-form]
         x_tenant_id: Annotated[
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
+        ] = None,
+        accept_doc_version: Annotated[
+            str | None, Header(alias="Accept-Docling-Document-Version")
         ] = None,
     ):
         prepared_request = _prepare_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
+        _validate_accept_doc_version(accept_doc_version)
         _log.info(f"[TENANT_ID] process_url endpoint received tenant_id='{tenant_id}'")
         task = await _enqueue_source(
-            orchestrator=orchestrator, request=prepared_request, tenant_id=tenant_id
+            orchestrator=orchestrator,
+            request=prepared_request,
+            tenant_id=tenant_id,
+            target_document_version=accept_doc_version,
         )
         completed = await _wait_task_complete(
             orchestrator=orchestrator, task_id=task.task_id
@@ -918,6 +915,7 @@ def create_app():  # noqa: C901
             task_result=task_result,
             orchestrator=orchestrator,
             background_tasks=background_tasks,
+            target_document_version=task.target_document_version,
         )
         return response
 
@@ -957,11 +955,15 @@ def create_app():  # noqa: C901
         x_tenant_id: Annotated[
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
         ] = None,
+        accept_doc_version: Annotated[
+            str | None, Header(alias="Accept-Docling-Document-Version")
+        ] = None,
     ):
         _check_file_upload(files, target_type)
         options = _prepare_convert_options(options)
         _validate_multipart_target_type(target_type)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
+        _validate_accept_doc_version(accept_doc_version)
         _log.info(f"[TENANT_ID] process_file endpoint received tenant_id='{tenant_id}'")
         target = _resolve_file_target(target_type)
         callbacks = [parse_callback_item(v) for v in callbacks_raw]
@@ -975,6 +977,7 @@ def create_app():  # noqa: C901
             target=target,
             callbacks=callbacks,
             tenant_id=tenant_id,
+            target_document_version=accept_doc_version,
         )
         completed = await _wait_task_complete(
             orchestrator=orchestrator, task_id=task.task_id
@@ -998,6 +1001,7 @@ def create_app():  # noqa: C901
             task_result=task_result,
             orchestrator=orchestrator,
             background_tasks=background_tasks,
+            target_document_version=task.target_document_version,
         )
         return response
 
@@ -1010,18 +1014,25 @@ def create_app():  # noqa: C901
     async def process_url_async(
         auth: Annotated[AuthenticationResult, Depends(require_auth)],
         orchestrator: Annotated[BaseOrchestrator, Depends(get_async_orchestrator)],
-        conversion_request: ConvertSourcesRequestModel,
+        conversion_request: ConvertSourcesRequestModel,  # ty: ignore[invalid-type-form]
         x_tenant_id: Annotated[
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
+        ] = None,
+        accept_doc_version: Annotated[
+            str | None, Header(alias="Accept-Docling-Document-Version")
         ] = None,
     ):
         prepared_request = _prepare_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
+        _validate_accept_doc_version(accept_doc_version)
         _log.info(
             f"[TENANT_ID] process_url_async endpoint received tenant_id='{tenant_id}'"
         )
         task = await _enqueue_source(
-            orchestrator=orchestrator, request=prepared_request, tenant_id=tenant_id
+            orchestrator=orchestrator,
+            request=prepared_request,
+            tenant_id=tenant_id,
+            target_document_version=accept_doc_version,
         )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
@@ -1029,7 +1040,7 @@ def create_app():  # noqa: C901
         return TaskStatusResponse(
             task_id=task.task_id,
             task_type=task.task_type,
-            task_status=task.task_status,
+            task_status=ConversionStatus(task.task_status.value),
             task_position=task_queue_position,
             task_meta=task.processing_meta,
             error_message=task.error_message,
@@ -1044,13 +1055,17 @@ def create_app():  # noqa: C901
     async def process_source_batch(
         auth: Annotated[AuthenticationResult, Depends(require_auth)],
         orchestrator: Annotated[BaseOrchestrator, Depends(get_async_orchestrator)],
-        conversion_request: BatchConvertSourcesRequestModel,
+        conversion_request: BatchConvertSourcesRequestModel,  # ty: ignore[invalid-type-form]
         x_tenant_id: Annotated[
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
+        ] = None,
+        accept_doc_version: Annotated[
+            str | None, Header(alias="Accept-Docling-Document-Version")
         ] = None,
     ):
         conversion_request = _prepare_batch_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
+        _validate_accept_doc_version(accept_doc_version)
         _log.info(
             f"[TENANT_ID] process_source_batch endpoint received tenant_id='{tenant_id}'"
         )
@@ -1058,6 +1073,7 @@ def create_app():  # noqa: C901
             orchestrator=orchestrator,
             request=conversion_request,
             tenant_id=tenant_id,
+            target_document_version=accept_doc_version,
         )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
@@ -1065,7 +1081,7 @@ def create_app():  # noqa: C901
         return TaskStatusResponse(
             task_id=task.task_id,
             task_type=task.task_type,
-            task_status=task.task_status,
+            task_status=ConversionStatus(task.task_status.value),
             task_position=task_queue_position,
             task_meta=task.processing_meta,
             error_message=task.error_message,
@@ -1101,11 +1117,15 @@ def create_app():  # noqa: C901
         x_tenant_id: Annotated[
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
         ] = None,
+        accept_doc_version: Annotated[
+            str | None, Header(alias="Accept-Docling-Document-Version")
+        ] = None,
     ):
         _check_file_upload(files, target_type)
         options = _prepare_convert_options(options)
         _validate_multipart_target_type(target_type)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
+        _validate_accept_doc_version(accept_doc_version)
         _log.info(
             f"[TENANT_ID] process_file_async endpoint received tenant_id='{tenant_id}'"
         )
@@ -1121,6 +1141,7 @@ def create_app():  # noqa: C901
             target=target,
             callbacks=callbacks,
             tenant_id=tenant_id,
+            target_document_version=accept_doc_version,
         )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
@@ -1128,7 +1149,7 @@ def create_app():  # noqa: C901
         return TaskStatusResponse(
             task_id=task.task_id,
             task_type=task.task_type,
-            task_status=task.task_status,
+            task_status=ConversionStatus(task.task_status.value),
             task_position=task_queue_position,
             task_meta=task.processing_meta,
             error_message=task.error_message,
@@ -1172,7 +1193,7 @@ def create_app():  # noqa: C901
             return TaskStatusResponse(
                 task_id=task.task_id,
                 task_type=task.task_type,
-                task_status=task.task_status,
+                task_status=ConversionStatus(task.task_status.value),
                 task_position=task_queue_position,
                 task_meta=task.processing_meta,
                 error_message=task.error_message,
@@ -1228,6 +1249,7 @@ def create_app():  # noqa: C901
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="presigned_url target is not supported for chunk endpoints.",
                 )
+            _check_file_upload(files, target_type)
             convert_options = _prepare_convert_options(convert_options)
             _validate_multipart_target_type(target_type)
             tenant_id = _get_tenant_id_from_header(x_tenant_id)
@@ -1254,7 +1276,7 @@ def create_app():  # noqa: C901
             return TaskStatusResponse(
                 task_id=task.task_id,
                 task_type=task.task_type,
-                task_status=task.task_status,
+                task_status=ConversionStatus(task.task_status.value),
                 task_position=task_queue_position,
                 task_meta=task.processing_meta,
                 error_message=task.error_message,
@@ -1370,6 +1392,7 @@ def create_app():  # noqa: C901
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="presigned_url target is not supported for chunk endpoints.",
                 )
+            _check_file_upload(files, target_type)
             convert_options = _prepare_convert_options(convert_options)
             _validate_multipart_target_type(target_type)
             tenant_id = _get_tenant_id_from_header(x_tenant_id)
@@ -1443,7 +1466,7 @@ def create_app():  # noqa: C901
         return TaskStatusResponse(
             task_id=task.task_id,
             task_type=task.task_type,
-            task_status=task.task_status,
+            task_status=ConversionStatus(task.task_status.value),
             task_position=task_queue_position,
             task_meta=task.processing_meta,
             error_message=task.error_message,
@@ -1507,7 +1530,7 @@ def create_app():  # noqa: C901
             task_response = TaskStatusResponse(
                 task_id=task.task_id,
                 task_type=task.task_type,
-                task_status=task.task_status,
+                task_status=ConversionStatus(task.task_status.value),
                 task_position=task_queue_position,
                 task_meta=task.processing_meta,
                 error_message=task.error_message,
@@ -1529,7 +1552,7 @@ def create_app():  # noqa: C901
                 task_response = TaskStatusResponse(
                     task_id=task.task_id,
                     task_type=task.task_type,
-                    task_status=task.task_status,
+                    task_status=ConversionStatus(task.task_status.value),
                     task_position=task_queue_position,
                     task_meta=task.processing_meta,
                     error_message=task.error_message,
@@ -1617,6 +1640,7 @@ def create_app():  # noqa: C901
                 task_result=task_result,
                 orchestrator=orchestrator,
                 background_tasks=background_tasks,
+                target_document_version=task.target_document_version,
             )
             return response
         except TaskNotFoundError:
