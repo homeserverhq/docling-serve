@@ -138,4 +138,3 @@ The Docling Serve codebase is under MIT license.
 ## IBM ❤️ Open Source AI
 
 Docling has been brought to you by IBM.
-
