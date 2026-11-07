@@ -101,6 +101,41 @@ def test_normalize_convert_options_ignores_threshold_when_description_inactive()
     assert normalized.picture_description_area_threshold == 0.05
 
 
+def test_normalize_convert_options_forces_picture_description_when_gated_on():
+    policy = build_service_policy(DoclingServeSettings())
+    settings = DoclingServeSettings(
+        force_picture_description=True,
+        picture_description_area_threshold=0.01,
+    )
+
+    normalized = normalize_convert_options(ConvertDocumentsOptions(), policy, settings)
+
+    assert normalized.do_picture_description is True
+    assert normalized.picture_description_area_threshold == 0.01
+
+
+def test_normalize_convert_options_respects_explicit_picture_description_off():
+    policy = build_service_policy(DoclingServeSettings())
+    settings = DoclingServeSettings(force_picture_description=True)
+
+    normalized = normalize_convert_options(
+        ConvertDocumentsOptions(do_picture_description=False), policy, settings
+    )
+
+    assert normalized.do_picture_description is False
+
+
+def test_normalize_convert_options_force_gate_off_is_noop():
+    policy = build_service_policy(DoclingServeSettings())
+
+    normalized = normalize_convert_options(
+        ConvertDocumentsOptions(), policy, DoclingServeSettings()
+    )
+
+    assert normalized.do_picture_description is False
+    assert normalized.picture_description_area_threshold == 0.05
+
+
 def test_normalize_convert_options_placeholder_disables_images():
     policy = build_service_policy(DoclingServeSettings())
 

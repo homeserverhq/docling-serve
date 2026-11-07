@@ -331,11 +331,18 @@ def normalize_convert_options(
     if options.document_timeout is None:
         updates["document_timeout"] = policy.max_document_timeout
 
+    # Deployment-wide default: run picture description with the default preset
+    # for callers that omit the flag. An explicit request value always wins.
+    if settings.force_picture_description and (
+        "do_picture_description" not in options.model_fields_set
+    ):
+        updates["do_picture_description"] = True
+
     # Docling copies the request-level threshold onto the picture description
     # options, overriding the preset's value. Apply the deployment default when
     # the caller omitted it, while preserving explicit overrides.
     picture_description_active = (
-        options.do_picture_description
+        updates.get("do_picture_description", options.do_picture_description)
         or options.picture_description_preset is not None
         or options.picture_description_custom_config is not None
         or options.picture_description_local is not None
